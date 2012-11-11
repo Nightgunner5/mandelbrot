@@ -4,19 +4,20 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"log"
 	"math/cmplx"
-	"os"
+	"net/http"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 )
 
 const (
-	Width, Height = 16384, 16384
+	Size       = 256
 	Iterations = (1<<16 - 1) / Brighten
-	Scale = 4.0 / Width
-	Brighten = 1024
+	Brighten   = 1024
 )
-
 
 func mandelbrot(c complex128) uint16 {
 	var z complex128
@@ -31,52 +32,83 @@ func mandelbrot(c complex128) uint16 {
 	return Iterations
 }
 
-var fractal [Width][Height]uint16
-
 type pixel struct {
-	x, y int
-	wg   *sync.WaitGroup
-}
-
-func compute(x, y int, wg *sync.WaitGroup) {
-	fractal[x][y] = mandelbrot(complex(float64(x-Width/2)*Scale, float64(y-Height/2)*Scale))
-
-	wg.Done()
+	out          *image.Gray16
+	x, y         int
+	tileX, tileY int64
+	tileZoom     uint8
+	wg           *sync.WaitGroup
 }
 
 var queue = make(chan pixel)
 
 func computeThread() {
 	for p := range queue {
-		compute(p.x, p.y, p.wg)
+		val := mandelbrot(
+			complex(
+				(float64(p.x)/Size+float64(p.tileX))/float64(uint(1<<p.tileZoom)),
+				(float64(p.y)/Size+float64(p.tileY))/float64(uint(1<<p.tileZoom)),
+			),
+		)
+		p.out.SetGray16(p.x, p.y, color.Gray16{val * Brighten})
+
+		p.wg.Done()
 	}
 }
 
 func main() {
-	var wg sync.WaitGroup
-
-	wg.Add(Width * Height)
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
 		go computeThread()
 	}
 
-	for x := 0; x < Width; x++ {
-		for y := 0; y < Height; y++ {
-			queue <- pixel{x, y, &wg}
+	log.Fatal(http.ListenAndServe(":6161", nil))
+}
+
+func renderTile(w http.ResponseWriter, r *http.Request) {
+	components := strings.Split(r.URL.Path, "/")[1:]
+
+	if len(components) != 4 || components[0] != "mandelbrot" || components[3][len(components[3])-4:] != ".png" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	components[3] = components[3][:len(components[3])-4]
+
+	tileX, err := strconv.ParseInt(components[2], 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	tileY, err := strconv.ParseInt(components[3], 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	tileZoom, err := strconv.ParseUint(components[1], 10, 8)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(Size * Size)
+
+	img := image.NewGray16(image.Rect(0, 0, Size, Size))
+
+	for x := 0; x < Size; x++ {
+		for y := 0; y < Size; y++ {
+			queue <- pixel{img, x, y, tileX, tileY, uint8(tileZoom), &wg}
 		}
 	}
-	close(queue)
 
 	wg.Wait()
 
-	img := image.NewGray16(image.Rect(0, 0, Width, Height))
-	for y, row := range fractal {
-		for x, val := range row {
-			img.SetGray16(x, y, color.Gray16{val * Brighten})
-		}
-	}
-	f, _ := os.Create("mandelbrot.png")
-	defer f.Close()
-	png.Encode(f, img)
+	w.Header().Set("Content-Type", "image/png")
+	png.Encode(w, img)
+}
+
+func init() {
+	http.HandleFunc("/mandelbrot/", renderTile)
 }
